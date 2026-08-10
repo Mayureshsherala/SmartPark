@@ -1,0 +1,1 @@
+ALTER TABLE auth_tokens MODIFY COLUMN purpose VARCHAR(40) NOT NULL;

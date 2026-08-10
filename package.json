@@ -1,0 +1,12 @@
+{
+  "name": "smart-parking-system",
+  "private": true,
+  "scripts": {
+    "install:all": "npm --prefix backend install && npm --prefix frontend install",
+    "dev": "npm run dev:database && concurrently \"npm --prefix backend run dev\" \"npm --prefix frontend run dev\"",
+    "dev:database": "docker compose up -d database",
+    "start": "npm --prefix backend start",
+    "build": "npm --prefix frontend run build"
+  },
+  "devDependencies": { "concurrently": "^9.1.2" }
+}

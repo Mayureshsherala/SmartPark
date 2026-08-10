@@ -1,0 +1,11 @@
+import { Router } from 'express';
+import { query } from '../config/db.js';
+import { authenticate } from '../middleware/auth.js';
+import { requireAdmin } from '../middleware/admin.js';
+import { sendReceipt } from '../utils/pdf.js';
+const router = Router(); const base = 'SELECT ps.*, u.name, u.email FROM parking_sessions ps JOIN users u ON u.user_id = ps.user_id';
+router.get('/', authenticate, requireAdmin, async (req, res, next) => { try { const rows = await query(`${base} ORDER BY ps.entry_time DESC`); return res.json({ success: true, data: rows }); } catch (error) { return next(error); } });
+router.get('/active', authenticate, async (req, res, next) => { try { const where = req.user.role === 'admin' ? 'ps.exit_time IS NULL' : 'ps.exit_time IS NULL AND ps.user_id = ?'; const values = req.user.role === 'admin' ? [] : [req.user.userId]; return res.json({ success: true, data: await query(`${base} WHERE ${where} ORDER BY ps.entry_time DESC`, values) }); } catch (error) { return next(error); } });
+router.get('/user/:uid', authenticate, async (req, res, next) => { try { const userId = req.user.role === 'admin' ? req.params.uid : req.user.userId; return res.json({ success: true, data: await query(`${base} WHERE ps.user_id = ? ORDER BY ps.entry_time DESC`, [userId]) }); } catch (error) { return next(error); } });
+router.get('/:id/receipt', authenticate, async (req, res, next) => { try { const [session] = await query(`${base} WHERE ps.session_id = ?`, [req.params.id]); if (!session) return res.status(404).json({ success: false, message: 'Session not found' }); if (req.user.role !== 'admin' && session.user_id !== req.user.userId) return res.status(403).json({ success: false, message: 'Not permitted' }); if (!session.exit_time) return res.status(409).json({ success: false, message: 'A receipt is available after the parking session ends' }); return sendReceipt(res, session); } catch (error) { return next(error); } });
+router.get('/:id', authenticate, async (req, res, next) => { try { const [session] = await query(`${base} WHERE ps.session_id = ?`, [req.params.id]); return session ? res.json({ success: true, data: session }) : res.status(404).json({ success: false, message: 'Session not found' }); } catch (error) { return next(error); } }); export default router;

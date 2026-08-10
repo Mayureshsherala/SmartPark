@@ -1,0 +1,2 @@
+ALTER TABLE users ADD COLUMN email_verified_at DATETIME NULL AFTER registered_date;
+CREATE TABLE IF NOT EXISTS auth_tokens (token_id BIGINT AUTO_INCREMENT PRIMARY KEY,user_id INT NULL,email VARCHAR(150) NOT NULL,purpose VARCHAR(40) NOT NULL,token_hash CHAR(64) NOT NULL,expires_at DATETIME NOT NULL,used_at DATETIME NULL,created_at DATETIME DEFAULT CURRENT_TIMESTAMP,INDEX idx_auth_tokens_lookup (email,purpose,expires_at),FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE);

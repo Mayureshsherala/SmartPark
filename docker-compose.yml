@@ -1,0 +1,51 @@
+services:
+  database:
+    image: mysql:8.4
+    container_name: smartpark-database
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: smart_parking
+      MYSQL_USER: smartpark
+      MYSQL_PASSWORD: smartpark
+      MYSQL_ROOT_PASSWORD: rootpassword
+      TZ: Asia/Kolkata
+    ports:
+      - "3307:3306"
+    volumes:
+      - smartpark_mysql:/var/lib/mysql
+      - ./database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./database/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-prootpassword"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  app:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: smartpark-app
+    restart: unless-stopped
+    depends_on:
+      database:
+        condition: service_healthy
+    environment:
+      PORT: 3000
+      CLIENT_ORIGIN: http://localhost:3001
+      JWT_SECRET: replace-this-before-production-with-a-long-random-value
+      JWT_EXPIRES_IN: 7d
+      DB_HOST: database
+      DB_PORT: 3306
+      DB_NAME: smart_parking
+      DB_USER: smartpark
+      DB_PASSWORD: smartpark
+      SECONDS_PER_HOUR: 5
+      NORMAL_RATE: 20
+      OVERTIME_RATE: 40
+      TZ: Asia/Kolkata
+    ports:
+      - "3001:3000"
+
+volumes:
+  smartpark_mysql:
