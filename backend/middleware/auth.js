@@ -10,4 +10,4 @@ export function authenticate(req, res, next) {
 }
 
 export const signToken = (user) => jwt.sign({ userId: user.user_id, role: user.role, name: user.name }, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || '7d' });
-export const sessionCookieOptions = { httpOnly: true, sameSite: 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000, path: '/' };
+export const sessionCookieOptions = { httpOnly: true, sameSite: process.env.COOKIE_SAME_SITE || 'lax', secure: process.env.NODE_ENV === 'production', maxAge: 7 * 24 * 60 * 60 * 1000, path: '/' };

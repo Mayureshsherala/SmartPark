@@ -15,10 +15,12 @@ import slotRoutes from './routes/slots.js';
 import sessionRoutes from './routes/sessions.js';
 import managementRoutes from './routes/management.js';
 
-const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: { origin: (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(','), methods: ['GET', 'POST'], credentials: true } });
+const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map((origin) => origin.trim()).filter(Boolean);
+const corsOptions = { origin(origin, callback) { if (!origin || allowedOrigins.includes(origin)) return callback(null, true); return callback(new Error('Origin is not allowed by CORS')); }, methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], credentials: true };
+const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: corsOptions });
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 let lastHardwareHeartbeat = Date.now(); let hardwareDisconnected = false;
-app.set('io', io); app.use(cors({ origin: (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(','), credentials: true })); app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin'); next(); }); app.use(express.json({ limit: '1mb' })); app.use(rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: true, legacyHeaders: false }));
+app.set('io', io); app.use(cors(corsOptions)); app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin'); next(); }); app.use(express.json({ limit: '1mb', verify: (req, _res, buffer) => { if (req.originalUrl === '/api/phonepe/webhook') req.rawBody = Buffer.from(buffer); } })); app.use(rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: true, legacyHeaders: false }));
 app.get('/api/health', async (_req, res) => { try { await query('SELECT 1'); return res.json({ success: true, data: { database: 'connected', uptime: process.uptime() } }); } catch { return res.status(503).json({ success: false, message: 'Database unavailable' }); } });
 const loginLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 5, standardHeaders: true, legacyHeaders: false, message: { success: false, message: 'Too many login attempts. Please try again in 15 minutes.' } });
 app.use('/api/auth/login', loginLimiter); app.use('/api/auth', authRoutes); app.use('/api/event', eventRoutes);

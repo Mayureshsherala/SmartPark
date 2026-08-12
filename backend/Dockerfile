@@ -10,6 +10,7 @@ WORKDIR /app/backend
 COPY backend/package*.json ./
 RUN npm install --omit=dev
 COPY backend/ ./
+COPY database/ /app/database/
 COPY --from=frontend-build /app/frontend/dist ./public
 ENV NODE_ENV=production
 EXPOSE 3000

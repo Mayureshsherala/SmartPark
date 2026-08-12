@@ -110,13 +110,84 @@ An unregistered card can be reported as `{ "event": "unknown_rfid", "slot": 4, "
 
 ## Database migrations
 
-For an existing database, apply `database/migrations/002_spec_alignment.sql`, `database/migrations/003_messaging_auth.sql`, `database/migrations/004_login_dual_otp.sql`, and `database/migrations/005_fastag_qr_refunds.sql` once. The messaging migrations add verification, password-reset, and login OTP storage.
+For an existing database, apply `database/migrations/002_spec_alignment.sql`, `database/migrations/003_messaging_auth.sql`, `database/migrations/004_login_dual_otp.sql`, `database/migrations/005_fastag_qr_refunds.sql`, and `database/migrations/006_phonepe_uat.sql` once. The messaging migrations add verification, password-reset, and login OTP storage.
 
 ## Billing and services
 
 `SECONDS_PER_HOUR=5` makes one parking hour equal five seconds for demos. Set it to `3600` in production. Standard billing is Rs.20 per registered hour, while every started extra hour is Rs.40. Monthly-pass sessions are logged at Rs.0.
 
 Razorpay and SMTP are optional during local development; leave their variables empty to use the built-in demo order path and console-only email notifications. Set their `.env` values before production use.
+
+## Razorpay checkout
+
+SmartPark uses Razorpay Checkout for the online Rs.20 pre-booking advance. The server creates the order and verifies Razorpay's payment signature before it reserves a slot or issues the payment receipt.
+
+1. In Razorpay Dashboard, switch to Live Mode and generate Live API keys from **Account & Settings → API Keys**.
+2. Add the keys to `backend/.env`; never put the secret in the frontend, Git, or a chat:
+   ```env
+   RAZORPAY_KEY_ID=rzp_live_your_key_id
+   RAZORPAY_KEY_SECRET=your_live_key_secret
+   ```
+3. Restart `npm run dev`, then choose **Razorpay payment** while booking. Razorpay Checkout presents the supported UPI, QR, card, net-banking, and wallet methods.
+
+For public real payments, the backend and database must also be deployed to a public HTTPS URL; the Vercel frontend alone cannot process SmartPark API requests.
+
+## Public deployment: Vercel + Railway
+
+Use Vercel for the React frontend and Railway for the persistent Express API and MySQL database. The Vercel site needs a public API address; without it, requests to `/api` remain on Vercel and registration, login, bookings, payments, and the live map cannot work.
+
+### 1. Deploy MySQL and the API on Railway
+
+1. Create a new Railway project at [railway.app](https://railway.app/).
+2. Click **New** → **Database** → **MySQL**.
+3. Click **New** → **GitHub Repo**, select this `SmartPark` repository, and name the service `smartpark-api`.
+4. Keep its root directory as `/`. The committed `railway.toml` builds `backend/Dockerfile`, runs the database bootstrap before deployment, and checks `/api/health`.
+5. In the API service's **Variables** tab, add these values. Replace `YOUR_VERCEL_DOMAIN` only with your production Vercel address:
+
+   ```env
+   NODE_ENV=production
+   CLIENT_ORIGIN=https://YOUR_VERCEL_DOMAIN.vercel.app
+   JWT_SECRET=use-a-new-long-random-secret-here
+   JWT_EXPIRES_IN=7d
+   DB_HOST=${{MySQL.MYSQLHOST}}
+   DB_PORT=${{MySQL.MYSQLPORT}}
+   DB_NAME=${{MySQL.MYSQLDATABASE}}
+   DB_USER=${{MySQL.MYSQLUSER}}
+   DB_PASSWORD=${{MySQL.MYSQLPASSWORD}}
+   SECONDS_PER_HOUR=3600
+   NORMAL_RATE=20
+   OVERTIME_RATE=40
+   HARDWARE_API_KEY=use-a-separate-long-random-key
+   INITIAL_ADMIN_NAME=Your Name
+   INITIAL_ADMIN_EMAIL=your-real-email@example.com
+   INITIAL_ADMIN_PASSWORD=choose-a-strong-password-with-a-number
+   ```
+
+   Also add `RAZORPAY_KEY_ID`, `RAZORPAY_KEY_SECRET`, and the SMTP variables if you use real payments and email OTPs. Keep all secrets only in Railway; never add them to GitHub or Vercel.
+6. Generate a public Railway domain. Open `https://YOUR_RAILWAY_DOMAIN/api/health`; it must report `database: connected`.
+
+The first successful Railway deploy creates the tables from `database/schema.sql` and creates the initial admin once. It never imports the local demo users or overwrites an existing production database.
+
+### 2. Point Vercel at the API
+
+1. Open the Vercel project → **Settings** → **Environment Variables**.
+2. Add the following Production variable, then redeploy the `main` branch:
+
+   ```env
+   VITE_API_URL=https://YOUR_RAILWAY_DOMAIN
+   ```
+
+3. Open the Vercel URL and create an account using a real email address. The frontend sends its access token to the Railway API, so registration and login work even though the sites use separate domains.
+
+For Preview deployments, add the preview Vercel URL to `CLIENT_ORIGIN` as a comma-separated value, or use a shared custom domain. Once you buy a domain, use `app.yourdomain.com` for Vercel and `api.yourdomain.com` for Railway, then set `CLIENT_ORIGIN=https://app.yourdomain.com`.
+
+### 3. Production checks
+
+- Confirm `/api/health` reports a connected database before opening Vercel.
+- Confirm registration sends an SMTP verification OTP and login sends a login OTP.
+- Confirm Razorpay Checkout opens using a live key and that a successful payment appears in the admin **Payments** page.
+- Configure the Raspberry Pi / ESP device to post to `https://YOUR_RAILWAY_DOMAIN/api/hardware/event` with the production `HARDWARE_API_KEY`.
+- Enable Railway MySQL backups and do not expose its TCP proxy publicly unless you need administrative database access.
 
 ## Email alerts
 

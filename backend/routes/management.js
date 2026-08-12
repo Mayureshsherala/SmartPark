@@ -9,10 +9,54 @@ import { requireAdmin } from '../middleware/admin.js';
 import { notify } from '../utils/notify.js';
 import { sendBookingConfirmation, sendBookingPaymentReceipt } from '../utils/pdf.js';
 import { bookingAlerts } from '../utils/bookingAlerts.js';
+import { createPhonePeCheckout, getPhonePeOrderStatus, isPhonePeConfigured } from '../utils/phonepe.js';
 
 const router = Router(); const admin = [authenticate, requireAdmin];
 router.use(bookingAlerts);
 const PREBOOKING_ADVANCE = 20;
+
+const phonePeRedirectUrl = (merchantOrderId) => {
+  const origin = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',')[0];
+  const redirect = new URL(process.env.PHONEPE_REDIRECT_URL || origin);
+  redirect.searchParams.set('phonepeOrder', merchantOrderId);
+  return redirect.toString();
+};
+
+const phonePeDetails = (payload) => Array.isArray(payload?.paymentDetails) ? payload.paymentDetails[0] : null;
+
+const settlePhonePeOrder = async ({ merchantOrderId, statusPayload, app }) => {
+  const state = String(statusPayload?.state || 'PENDING').toUpperCase();
+  if (state !== 'COMPLETED') {
+    await query('UPDATE phonepe_payment_attempts SET state = ?, response_payload = ? WHERE merchant_order_id = ?', [state, JSON.stringify(statusPayload), merchantOrderId]);
+    return { state, paid: false };
+  }
+  const details = phonePeDetails(statusPayload);
+  const result = await withTransaction(async (connection) => {
+    const [[attempt]] = await connection.execute('SELECT * FROM phonepe_payment_attempts WHERE merchant_order_id = ? FOR UPDATE', [merchantOrderId]);
+    if (!attempt) throw Object.assign(new Error('PhonePe payment attempt was not found'), { status: 404 });
+    if (Number(statusPayload.amount) !== Number(attempt.amount_paisa)) throw Object.assign(new Error('PhonePe payment amount does not match this booking'), { status: 409 });
+    if (attempt.state === 'COMPLETED') return { paid: false, attempt, booking: null };
+    const [[booking]] = await connection.execute('SELECT * FROM bookings WHERE booking_id = ? AND user_id = ? FOR UPDATE', [attempt.booking_id, attempt.user_id]);
+    if (!booking || booking.status !== 'pending') throw Object.assign(new Error('This booking can no longer be paid'), { status: 409 });
+    if (booking.payment_status === 'paid') {
+      await connection.execute('UPDATE phonepe_payment_attempts SET state = ?, phonepe_order_id = ?, phonepe_transaction_id = ?, response_payload = ? WHERE merchant_order_id = ?', ['COMPLETED', statusPayload.orderId || null, details?.transactionId || null, JSON.stringify(statusPayload), merchantOrderId]);
+      return { paid: false, attempt, booking };
+    }
+    const [reservation] = await connection.execute("UPDATE slots SET status = 'reserved', last_updated = NOW() WHERE slot_id = ? AND status = 'free'", [booking.slot_number]);
+    if (!reservation.affectedRows) throw Object.assign(new Error('Selected slot is no longer available'), { status: 409 });
+    const reference = details?.transactionId || statusPayload.orderId || merchantOrderId;
+    await connection.execute("INSERT INTO payments (user_id, booking_id, amount, payment_mode, payment_time, razorpay_id, status) VALUES (?, ?, ?, 'phonepe_upi', NOW(), ?, 'success')", [attempt.user_id, booking.booking_id, Number(attempt.amount_paisa) / 100, reference]);
+    await connection.execute("UPDATE bookings SET payment_status = 'paid', razorpay_id = ? WHERE booking_id = ?", [reference, booking.booking_id]);
+    await connection.execute('UPDATE phonepe_payment_attempts SET state = ?, phonepe_order_id = ?, phonepe_transaction_id = ?, response_payload = ? WHERE merchant_order_id = ?', ['COMPLETED', statusPayload.orderId || null, details?.transactionId || null, JSON.stringify(statusPayload), merchantOrderId]);
+    return { paid: true, attempt, booking };
+  });
+  if (result.paid) {
+    const [user] = await query('SELECT email, phone FROM users WHERE user_id = ?', [result.attempt.user_id]);
+    app.get('io').emit('slotStatusChange', { slot: Number(result.booking.slot_number), status: 'reserved', user_name: 'Reserved' });
+    await notify(app.get('io'), result.attempt.user_id, 'phonepe_payment', `PhonePe UPI payment of Rs.${PREBOOKING_ADVANCE} completed for Booking #${result.booking.booking_id}. Slot ${result.booking.slot_number} is reserved.`, user?.email, user?.phone);
+  }
+  return { state, paid: result.paid, booking: result.booking };
+};
 
 router.post('/booking', authenticate, async (req, res, next) => {
   try {
@@ -57,7 +101,50 @@ router.get('/booking/:id/confirmation', authenticate, async (req, res, next) => 
 router.get('/booking/:id/payment-receipt', authenticate, async (req, res, next) => { try { const [booking] = await query('SELECT b.*, u.name, p.payment_id, p.payment_time, p.payment_mode, p.razorpay_id FROM bookings b JOIN users u ON u.user_id = b.user_id LEFT JOIN payments p ON p.payment_id = (SELECT payment_id FROM payments WHERE booking_id = b.booking_id AND status = \'success\' ORDER BY payment_time DESC LIMIT 1) WHERE b.booking_id = ?', [req.params.id]); if (!booking) return res.status(404).json({ success: false, message: 'Booking not found' }); if (booking.user_id !== req.user.userId && req.user.role !== 'admin') return res.status(403).json({ success: false, message: 'Not permitted' }); if (booking.payment_status !== 'paid') return res.status(409).json({ success: false, message: 'Payment receipt is available after payment completes' }); return sendBookingPaymentReceipt(res, booking); } catch (error) { return next(error); } });
 router.post('/payment/order', authenticate, async (req, res, next) => { try { const { bookingId, sessionId, amount } = req.body; let payable = Number(amount); if (bookingId) { const [booking] = await query("SELECT amount_paid, status FROM bookings WHERE booking_id = ? AND user_id = ?", [bookingId, req.user.userId]); if (!booking || !['pending', 'active'].includes(booking.status)) return res.status(404).json({ success: false, message: 'Payable booking not found' }); payable = Number(booking.amount_paid); } if (!payable || payable <= 0) return res.status(400).json({ success: false, message: 'A valid amount is required' }); if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) return res.json({ success: true, data: { demo: true, amount: payable * 100, receipt: `demo_${Date.now()}` }, message: 'Demo payment order created' }); const razorpay = new Razorpay({ key_id: process.env.RAZORPAY_KEY_ID, key_secret: process.env.RAZORPAY_KEY_SECRET }); const order = await razorpay.orders.create({ amount: Math.round(payable * 100), currency: 'INR', receipt: `park_${bookingId || sessionId || Date.now()}` }); return res.json({ success: true, data: { ...order, key: process.env.RAZORPAY_KEY_ID } }); } catch (error) { return next(error); } });
 router.post('/payment/verify', authenticate, async (req, res, next) => { try { const { bookingId, sessionId, amount, razorpayPaymentId, razorpayOrderId, razorpaySignature, mode = 'online' } = req.body; if (process.env.RAZORPAY_KEY_ID && process.env.RAZORPAY_KEY_SECRET) { if (!razorpayPaymentId || !razorpayOrderId || !razorpaySignature) return res.status(400).json({ success: false, message: 'Payment gateway verification details are required' }); const expected = crypto.createHmac('sha256', process.env.RAZORPAY_KEY_SECRET).update(`${razorpayOrderId}|${razorpayPaymentId}`).digest('hex'); if (!crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(razorpaySignature))) return res.status(400).json({ success: false, message: 'Payment verification failed' }); } let payable = Number(amount); let booking; if (bookingId) { [booking] = await query("SELECT booking_id, amount_paid, status, payment_status, slot_number FROM bookings WHERE booking_id = ? AND user_id = ?", [bookingId, req.user.userId]); if (!booking || !['pending', 'active'].includes(booking.status)) return res.status(404).json({ success: false, message: 'Payable booking not found' }); if (booking.payment_status === 'paid') return res.status(409).json({ success: false, message: 'This booking is already paid' }); payable = Number(booking.amount_paid); } if (!payable || payable < 0) return res.status(400).json({ success: false, message: 'A valid payment amount is required' }); await withTransaction(async (connection) => { if (bookingId) { const [reservation] = await connection.execute("UPDATE slots SET status = 'reserved', last_updated = NOW() WHERE slot_id = ? AND status = 'free'", [booking.slot_number]); if (!reservation.affectedRows) throw Object.assign(new Error('Selected slot is no longer available'), { status: 409 }); } await connection.execute('INSERT INTO payments (session_id, user_id, booking_id, amount, payment_mode, payment_time, razorpay_id, status) VALUES (?, ?, ?, ?, ?, NOW(), ?, ?)', [sessionId || null, req.user.userId, bookingId || null, payable, mode, razorpayPaymentId || null, 'success']); if (bookingId) await connection.execute("UPDATE bookings SET payment_status = 'paid', razorpay_id = ? WHERE booking_id = ? AND user_id = ?", [razorpayPaymentId || null, bookingId, req.user.userId]); if (sessionId) await connection.execute("UPDATE parking_sessions SET payment_status = 'paid', payment_mode = ? WHERE session_id = ? AND user_id = ?", [mode, sessionId, req.user.userId]); }); if (booking) req.app.get('io').emit('slotStatusChange', { slot: Number(booking.slot_number), status: 'reserved', user_name: 'Reserved' }); req.app.get('io').emit('paymentConfirmed', { bookingId, sessionId }); return res.json({ success: true, data: { slot_number: booking?.slot_number }, message: 'Payment verified and slot reserved' }); } catch (error) { return next(error); } });
+router.post('/phonepe/booking/:id/initiate', authenticate, async (req, res, next) => {
+  try {
+    if (!isPhonePeConfigured()) return res.status(503).json({ success: false, message: 'PhonePe UAT is not configured. Add PHONEPE_CLIENT_ID and PHONEPE_CLIENT_SECRET to backend/.env.' });
+    const [booking] = await query("SELECT b.*, u.phone FROM bookings b JOIN users u ON u.user_id = b.user_id WHERE b.booking_id = ? AND b.user_id = ?", [req.params.id, req.user.userId]);
+    if (!booking || booking.status !== 'pending' || booking.payment_status === 'paid') return res.status(404).json({ success: false, message: 'An unpaid pending booking is required for PhonePe payment.' });
+    const merchantOrderId = `SP_${booking.booking_id}_${Date.now()}_${crypto.randomBytes(3).toString('hex')}`;
+    const amountPaisa = Math.round(Number(booking.amount_paid) * 100);
+    await query('INSERT INTO phonepe_payment_attempts (merchant_order_id, booking_id, user_id, amount_paisa) VALUES (?, ?, ?, ?)', [merchantOrderId, booking.booking_id, req.user.userId, amountPaisa]);
+    let checkout;
+    try {
+      checkout = await createPhonePeCheckout({ merchantOrderId, amountPaisa, redirectUrl: phonePeRedirectUrl(merchantOrderId), phoneNumber: booking.phone, metaInfo: { udf1: String(booking.booking_id), udf2: String(req.user.userId), udf3: 'SmartPark' } });
+    } catch (error) {
+      await query('UPDATE phonepe_payment_attempts SET state = ? WHERE merchant_order_id = ?', ['INITIATION_FAILED', merchantOrderId]);
+      throw error;
+    }
+    await query('UPDATE phonepe_payment_attempts SET phonepe_order_id = ?, state = ?, response_payload = ? WHERE merchant_order_id = ?', [checkout.orderId || null, checkout.state || 'PENDING', JSON.stringify(checkout), merchantOrderId]);
+    return res.status(201).json({ success: true, data: { merchantOrderId, bookingId: booking.booking_id, amount: Number(booking.amount_paid), state: checkout.state || 'PENDING', redirectUrl: checkout.redirectUrl, expiresAt: checkout.expireAt }, message: 'PhonePe UAT checkout is ready. Complete the UPI payment on PhonePe.' });
+  } catch (error) { return next(error); }
+});
+router.get('/phonepe/order/:merchantOrderId/status', authenticate, async (req, res, next) => {
+  try {
+    const [attempt] = await query('SELECT merchant_order_id FROM phonepe_payment_attempts WHERE merchant_order_id = ? AND user_id = ?', [req.params.merchantOrderId, req.user.userId]);
+    if (!attempt) return res.status(404).json({ success: false, message: 'PhonePe payment attempt not found.' });
+    const statusPayload = await getPhonePeOrderStatus(attempt.merchant_order_id);
+    const result = await settlePhonePeOrder({ merchantOrderId: attempt.merchant_order_id, statusPayload, app: req.app });
+    return res.json({ success: true, data: { merchantOrderId: attempt.merchant_order_id, state: result.state, paid: result.paid, bookingId: result.booking?.booking_id || null }, message: result.paid ? 'PhonePe payment completed and slot reserved.' : `PhonePe payment is ${result.state.toLowerCase()}.` });
+  } catch (error) { return next(error); }
+});
+router.post('/phonepe/webhook', async (req, res) => {
+  const providedSignature = String(req.headers['phonepe-checksum-signature'] || '').replace(/^sha256[=\s]/i, '');
+  const authorization = String(req.headers.authorization || '').replace(/^sha256[=\s]/i, '');
+  const rawPayload = req.rawBody || Buffer.from(JSON.stringify(req.body || {}));
+  const expectedSignature = process.env.PHONEPE_WEBHOOK_SECRET ? crypto.createHmac('sha256', process.env.PHONEPE_WEBHOOK_SECRET).update(rawPayload).digest('hex') : '';
+  const expectedAuthorization = process.env.PHONEPE_WEBHOOK_USERNAME && process.env.PHONEPE_WEBHOOK_PASSWORD ? crypto.createHash('sha256').update(`${process.env.PHONEPE_WEBHOOK_USERNAME}:${process.env.PHONEPE_WEBHOOK_PASSWORD}`).digest('hex') : '';
+  const matches = (actual, expected) => actual && expected && actual.length === expected.length && crypto.timingSafeEqual(Buffer.from(actual), Buffer.from(expected));
+  if (!matches(providedSignature, expectedSignature) && !matches(authorization, expectedAuthorization)) return res.status(401).json({ success: false, message: 'Invalid PhonePe webhook signature.' });
+  const payload = req.body?.payload || req.body || {};
+  const merchantOrderId = payload.merchantOrderId;
+  if (!merchantOrderId) return res.status(400).json({ success: false, message: 'PhonePe webhook is missing merchantOrderId.' });
+  res.status(202).json({ success: true, data: {}, message: 'PhonePe webhook accepted.' });
+  getPhonePeOrderStatus(merchantOrderId).then((statusPayload) => settlePhonePeOrder({ merchantOrderId, statusPayload, app: req.app })).catch((error) => console.error('PhonePe webhook verification failed:', error.message));
+});
 router.get('/payment/history', authenticate, async (req, res, next) => { try { return res.json({ success: true, data: await query('SELECT * FROM payments WHERE user_id = ? ORDER BY payment_time DESC', [req.user.userId]) }); } catch (error) { return next(error); } });
+router.get('/payments/admin/all', ...admin, async (_req, res, next) => { try { const payments = await query("SELECT p.*, u.name, u.email, b.slot_number, b.expected_arrival, b.duration_hours FROM payments p JOIN users u ON u.user_id = p.user_id LEFT JOIN bookings b ON b.booking_id = p.booking_id ORDER BY p.payment_time DESC"); return res.json({ success: true, data: payments }); } catch (error) { return next(error); } });
 router.get('/users', ...admin, async (req, res, next) => { try { const { search = '', page = 1, limit = 20 } = req.query; const safeLimit = Math.min(Math.max(Number.parseInt(limit, 10) || 20, 1), 100); const safeOffset = Math.max((Number.parseInt(page, 10) - 1) * safeLimit, 0); const rows = await query(`SELECT user_id, name, email, phone, vehicle_number, rfid_uid, status, pass_type, role, registered_date FROM users WHERE name LIKE ? OR email LIKE ? OR vehicle_number LIKE ? ORDER BY registered_date DESC LIMIT ${safeLimit} OFFSET ${safeOffset}`, [`%${search}%`, `%${search}%`, `%${search}%`]); return res.json({ success: true, data: rows }); } catch (error) { return next(error); } });
 router.post('/users', ...admin, async (req, res, next) => { try { const { name, email, password, phone, vehicleNumber, role = 'user' } = req.body; const result = await query('INSERT INTO users (name, email, password, phone, vehicle_number, role) VALUES (?, ?, ?, ?, ?, ?)', [name, email, await bcrypt.hash(password || 'parking123', 12), phone || null, vehicleNumber || null, role]); return res.status(201).json({ success: true, data: { user_id: result.insertId }, message: 'User created' }); } catch (error) { return next(error); } });
 router.put('/users/:id/block', ...admin, async (req, res, next) => { try { const status = req.body.blocked ? 'blocked' : 'active'; await query('UPDATE users SET status = ? WHERE user_id = ?', [status, req.params.id]); return res.json({ success: true, data: { status }, message: `User ${status}` }); } catch (error) { return next(error); } });

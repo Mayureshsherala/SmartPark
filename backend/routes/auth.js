@@ -15,7 +15,7 @@ const normalizedEmail = (value) => String(value || '').trim().toLowerCase();
 const hashOtp = (value) => crypto.createHash('sha256').update(String(value)).digest('hex');
 const otpLimiter = rateLimit({ windowMs: 15 * 60 * 1000, limit: 5, standardHeaders: true, legacyHeaders: false, message: { success: false, message: 'Too many OTP requests. Please try again in 15 minutes.' } });
 
-const writeSession = (res, user) => res.cookie('smartpark_token', signToken(user), sessionCookieOptions).json({ success: true, data: { user: cleanUser(user) }, message: 'Welcome back' });
+const writeSession = (res, user) => { const accessToken = signToken(user); return res.cookie('smartpark_token', accessToken, sessionCookieOptions).json({ success: true, data: { user: cleanUser(user), accessToken }, message: 'Welcome back' }); };
 const signLoginVerification = (user) => jwt.sign({ userId: user.user_id, type: 'login_verification' }, process.env.JWT_SECRET, { expiresIn: '10m' });
 
 async function createOtp(user, purpose) {
@@ -65,7 +65,8 @@ router.post('/register', async (req, res, next) => {
     const result = await query('INSERT INTO users (name, email, phone, password, vehicle_number, vehicle_type, vehicle_color, vehicle_model, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [name.trim(), accountEmail, String(phone).replace(/\D/g, ''), await bcrypt.hash(password, 12), vehicleNumber?.toUpperCase() || null, vehicleType || 'car', vehicleColor || null, vehicleModel || null, 'pending_rfid']);
     const [user] = await query('SELECT * FROM users WHERE user_id = ?', [result.insertId]);
     await createAndSendOtp(user, 'email_verification');
-    return res.status(201).cookie('smartpark_token', signToken(user), sessionCookieOptions).json({ success: true, data: { user: cleanUser(user) }, message: 'Registration successful. Check your email for the verification OTP.' });
+    const accessToken = signToken(user);
+    return res.status(201).cookie('smartpark_token', accessToken, sessionCookieOptions).json({ success: true, data: { user: cleanUser(user), accessToken }, message: 'Registration successful. Check your email for the verification OTP.' });
   } catch (error) { return next(error); }
 });
 
