@@ -81,9 +81,15 @@ router.post('/login', async (req, res, next) => {
     const [user] = await query('SELECT * FROM users WHERE email = ?', [normalizedEmail(email)]);
     if (!user || !(await bcrypt.compare(password || '', user.password))) return res.status(401).json({ success: false, message: 'Invalid email or password' });
     if (user.status === 'blocked') return res.status(403).json({ success: false, message: 'Invalid email or password' });
-    await createAndSendLoginOtp(user);
+    try { await createAndSendLoginOtp(user); } catch (error) {
+      console.error('Login OTP email delivery failed:', error.message);
+      return res.status(503).json({ success: false, message: 'We could not send your login OTP. Check the SMTP settings in Railway, then try again.' });
+    }
     return res.json({ success: true, data: { requiresLoginVerification: true, loginVerificationToken: signLoginVerification(user), email: user.email }, message: 'A login OTP was sent to your email.' });
-  } catch (error) { return next(error); }
+  } catch (error) {
+    console.error('Login OTP resend failed:', error.message);
+    return res.status(503).json({ success: false, message: 'We could not send your login OTP. Check the SMTP settings in Railway, then try again.' });
+  }
 });
 
 router.post('/login/resend', otpLimiter, async (req, res, next) => {

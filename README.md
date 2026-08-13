@@ -153,6 +153,17 @@ For an existing database, apply `database/migrations/002_spec_alignment.sql`, `d
 
 Razorpay and SMTP are optional during local development; leave their variables empty to use the built-in demo order path and console-only email notifications. Set their `.env` values before production use.
 
+### Production OTP email
+
+Railway can run behind a proxy and may not be able to reach every external SMTP server. SmartPark supports the Resend HTTPS email API for reliable production OTP delivery. Create an API key in [Resend](https://resend.com), then add these Railway variables:
+
+```env
+RESEND_API_KEY=re_your_api_key
+EMAIL_FROM=SmartPark <onboarding@resend.dev>
+```
+
+The `onboarding@resend.dev` sender is for testing and can send only to the email address of the Resend account. For all SmartPark users, verify a domain in Resend and set `EMAIL_FROM` to an address at that domain. When `RESEND_API_KEY` is present, SmartPark uses it instead of SMTP.
+
 ## Razorpay checkout
 
 SmartPark uses Razorpay Checkout for the online Rs.20 pre-booking advance. The server creates the order and verifies Razorpay's payment signature before it reserves a slot or issues the payment receipt.

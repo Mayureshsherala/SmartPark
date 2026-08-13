@@ -17,7 +17,7 @@ import managementRoutes from './routes/management.js';
 
 const allowedOrigins = (process.env.CLIENT_ORIGIN || 'http://localhost:5173').split(',').map((origin) => origin.trim()).filter(Boolean);
 const corsOptions = { origin(origin, callback) { if (!origin || allowedOrigins.includes(origin)) return callback(null, true); return callback(new Error('Origin is not allowed by CORS')); }, methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'], credentials: true };
-const app = express(); const server = http.createServer(app); const io = new Server(server, { cors: corsOptions });
+const app = express(); app.set('trust proxy', 1); const server = http.createServer(app); const io = new Server(server, { cors: corsOptions });
 const dirname = path.dirname(fileURLToPath(import.meta.url));
 let lastHardwareHeartbeat = Date.now(); let hardwareDisconnected = false;
 app.set('io', io); app.use(cors(corsOptions)); app.use((_req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); res.setHeader('X-Frame-Options', 'DENY'); res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin'); next(); }); app.use(express.json({ limit: '1mb', verify: (req, _res, buffer) => { if (req.originalUrl === '/api/phonepe/webhook') req.rawBody = Buffer.from(buffer); } })); app.use(rateLimit({ windowMs: 60_000, limit: 100, standardHeaders: true, legacyHeaders: false }));
