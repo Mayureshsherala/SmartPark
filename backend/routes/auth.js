@@ -38,7 +38,12 @@ async function createAndSendOtp(user, purpose) {
 
 async function createAndSendLoginOtp(user) {
   const emailCode = await createOtp(user, 'login_email');
-  await sendEmail({ to: user.email, subject: 'SmartPark login OTP', text: `Your SmartPark login OTP is ${emailCode}. It expires in 10 minutes. Do not share this code.` });
+  const delivered = await sendEmail({ to: user.email, subject: 'SmartPark login OTP', text: `Your SmartPark login OTP is ${emailCode}. It expires in 10 minutes. Do not share this code.` });
+  if (!delivered) {
+    const error = new Error('Email OTP delivery is not configured. Ask the administrator to set the SMTP variables in Railway.');
+    error.status = 503;
+    throw error;
+  }
 }
 
 async function consumeOtp(email, purpose, code) {
@@ -82,14 +87,17 @@ router.post('/login', async (req, res, next) => {
 });
 
 router.post('/login/resend', otpLimiter, async (req, res, next) => {
+  let verification;
   try {
-    const verification = jwt.verify(req.body.loginVerificationToken || '', process.env.JWT_SECRET);
-    if (verification.type !== 'login_verification') return res.status(401).json({ success: false, message: 'Invalid login verification request' });
+    verification = jwt.verify(req.body.loginVerificationToken || '', process.env.JWT_SECRET);
+  } catch (error) { return res.status(401).json({ success: false, message: 'Login verification has expired. Please sign in again.' }); }
+  if (verification.type !== 'login_verification') return res.status(401).json({ success: false, message: 'Invalid login verification request' });
+  try {
     const [user] = await query('SELECT * FROM users WHERE user_id = ? AND status <> ?', [verification.userId, 'blocked']);
     if (!user) return res.status(401).json({ success: false, message: 'Login verification has expired' });
     await createAndSendLoginOtp(user);
     return res.json({ success: true, data: {}, message: 'A new login OTP was sent to your email.' });
-  } catch (error) { return res.status(401).json({ success: false, message: 'Login verification has expired. Please sign in again.' }); }
+  } catch (error) { return next(error); }
 });
 
 router.post('/login/verify', otpLimiter, async (req, res, next) => {

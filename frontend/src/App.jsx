@@ -12,7 +12,22 @@ const localDateTime = (value = new Date()) => new Date(value.getTime() - value.g
 const API_BASE_URL = String(import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
 const apiUrl = (url) => `${API_BASE_URL}${url}`;
 const accessToken = () => sessionStorage.getItem('smartpark_access_token');
-const api = async (url, options = {}) => { const token = accessToken(); const response = await fetch(apiUrl(url), { credentials: API_BASE_URL ? 'omit' : 'include', headers: { 'Content-Type':'application/json', ...(token ? { Authorization:`Bearer ${token}` } : {}), ...options.headers }, ...options }); const payload = await response.text(); let body; try { body = payload ? JSON.parse(payload) : {}; } catch { body = { message: payload || `Request failed with status ${response.status}` }; } if (!response.ok) throw new Error(body.message || `Request failed with status ${response.status}`); return body; };
+const api = async (url, options = {}) => {
+  const token = accessToken();
+  const controller = new AbortController();
+  const timeout = window.setTimeout(() => controller.abort(), 20_000);
+  try {
+    const response = await fetch(apiUrl(url), { ...options, credentials: API_BASE_URL ? 'omit' : 'include', headers: { 'Content-Type':'application/json', ...(token ? { Authorization:`Bearer ${token}` } : {}), ...options.headers }, signal: options.signal || controller.signal });
+    const payload = await response.text();
+    let body;
+    try { body = payload ? JSON.parse(payload) : {}; } catch { body = { message: payload || `Request failed with status ${response.status}` }; }
+    if (!response.ok) throw new Error(body.message || `Request failed with status ${response.status}`);
+    return body;
+  } catch (error) {
+    if (error.name === 'AbortError') throw new Error('The SmartPark server did not respond. Check the deployed API connection, then try again.');
+    throw error;
+  } finally { window.clearTimeout(timeout); }
+};
 const loadRazorpay = () => new Promise((resolve) => { if (window.Razorpay) return resolve(true); const script = document.createElement('script'); script.src = 'https://checkout.razorpay.com/v1/checkout.js'; script.onload = () => resolve(true); script.onerror = () => resolve(false); document.body.appendChild(script); });
 
 function SlotCard({ slot, selectable, selected, onSelect, admin, onGate }) { const occupied = slot.status === 'occupied'; const elapsed = Number(slot.elapsed_minutes || 0); const duration = `${Math.floor(elapsed / 60)}h ${elapsed % 60}m`; return <motion.button whileHover={{ y:-3 }} onClick={() => selectable && slot.status === 'free' && onSelect(slot)} className={`slot-card ${slot.status} ${selected ? 'selected' : ''} ${selectable && slot.status === 'free' ? 'selectable' : ''}`}><div className="slot-top"><span className="slot-id">{slot.label || `P-${String(slot.slot_id).padStart(2,'0')}`}</span><span className="status-dot"/></div><Car size={30} strokeWidth={1.8}/><strong>{slot.status}</strong><small>{occupied ? slot.user_name || (admin ? 'Vehicle detected' : 'User ***') : slot.status === 'reserved' ? 'Reserved soon' : slot.status === 'maintenance' ? 'Temporarily unavailable' : 'Ready to park'}</small>{occupied && <span className={`slot-time ${slot.is_overtime ? 'overtime' : ''}`}>{duration} · {formatMoney(slot.live_bill || 0)}{slot.is_overtime ? ' · OT' : ''}</span>}{admin && <span onClick={(event) => { event.stopPropagation(); onGate(slot, slot.gate_status === 'open' ? 'close' : 'open'); }} className="gate-button"><DoorOpen size={14}/>{slot.gate_status === 'open' ? 'Close gate' : 'Open gate'}</span>}</motion.button>; }
@@ -232,10 +247,12 @@ function Auth({ mode, close, onLogin }) {
   const [loginVerificationToken, setLoginVerificationToken] = useState('');
   const [form, setForm] = useState({ name:'', email:'', phone:'', password:'', confirmPassword:'', code:'', emailOtp:'', vehicleNumber:'', vehicleType:'car' });
   const [message, setMessage] = useState('');
+  const [submitting, setSubmitting] = useState(false);
   const update = (event) => setForm({ ...form, [event.target.name]:event.target.value });
   const submit = async (event) => {
     event.preventDefault();
-    setMessage('');
+    setMessage('Contacting SmartPark…');
+    setSubmitting(true);
     try {
       if (view === 'loginOtp') {
         const result = await api('/api/auth/login/verify', { method:'POST', body:JSON.stringify({ loginVerificationToken, emailOtp:form.emailOtp }) });
@@ -260,7 +277,7 @@ function Auth({ mode, close, onLogin }) {
         return setMessage(`OTP sent to ${result.data.email}.`);
       }
       onLogin(result.data);
-    } catch (error) { setMessage(error.message); }
+    } catch (error) { setMessage(error.message || 'Unable to complete your request. Please try again.'); } finally { setSubmitting(false); }
   };
   const fields = view === 'loginOtp' ? <><label>Email OTP<input required name="emailOtp" inputMode="numeric" maxLength="6" value={form.emailOtp} onChange={update}/></label><button type="button" className="link" onClick={async () => { try { const result = await api('/api/auth/login/resend', { method:'POST', body:JSON.stringify({ loginVerificationToken }) }); setMessage(result.message); } catch (error) { setMessage(error.message); } }}>Resend email OTP</button></> : view === 'forgot' ? <>{!resetSent ? <label>Email<input required name="email" type="email" value={form.email} onChange={update}/></label> : <><label>Email<input required name="email" type="email" value={form.email} onChange={update}/></label><label>OTP<input required name="code" inputMode="numeric" maxLength="6" value={form.code} onChange={update}/></label><label>New password<input required minLength="8" name="password" type="password" value={form.password} onChange={update}/></label><label>Confirm password<input required minLength="8" name="confirmPassword" type="password" value={form.confirmPassword} onChange={update}/></label></>}</> : mode === 'login' ? <><label>Email<input required name="email" type="email" value={form.email} onChange={update}/></label><label>Password<input required name="password" type="password" value={form.password} onChange={update}/></label><div className="form-row"><label className="checkbox"><input type="checkbox"/> Remember me</label><button type="button" className="link" onClick={() => { setView('forgot'); setMessage(''); }}>Forgot password?</button></div></> : registerStep === 1 ? <><label>Full name<input required name="name" value={form.name} onChange={update}/></label><label>Email address<input required name="email" type="email" value={form.email} onChange={update}/></label><label>Phone number<input required name="phone" value={form.phone} onChange={update}/></label><label>Create password<input required minLength="8" name="password" type="password" value={form.password} onChange={update}/></label><label>Confirm password<input required minLength="8" name="confirmPassword" type="password" value={form.confirmPassword} onChange={update}/></label></> : registerStep === 2 ? <><label>Vehicle number<input required name="vehicleNumber" placeholder="MH 12 AB 1234" value={form.vehicleNumber} onChange={update}/></label><label>Vehicle type<select name="vehicleType" value={form.vehicleType} onChange={update}><option>car</option><option>bike</option><option>other</option></select></label></> : <div className="success-upload"><span><UserRound size={28}/></span><h3>Profile photo</h3><p>Optional — you can add this later from your profile.</p></div>;
   const title = view === 'loginOtp' ? 'Verify your login.' : view === 'forgot' ? (resetSent ? 'Set a new password.' : 'Reset your password.') : mode === 'login' ? 'Park smarter today.' : ['A few details first.','Tell us about your vehicle.','Almost done!'][registerStep - 1];
