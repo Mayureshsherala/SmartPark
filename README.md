@@ -108,6 +108,41 @@ The Pi endpoint accepts these JSON bodies:
 
 An unregistered card can be reported as `{ "event": "unknown_rfid", "slot": 4, "uid": "XX XX XX XX" }`. All real-time clients receive `slotStatusChange`, `heartbeatSync`, `billTick`, `newBooking`, `unknownRFID`, `hardwareDisconnect`, and legacy-compatible slot events via Socket.io.
 
+## Raspberry Pi 3B+ prototype
+
+`hardware/raspberry_pi_controller.py` operates the prototype wiring: six MFRC522 readers, six IR obstacle sensors, the 4x3 keypad, PCA9548A I2C multiplexer, DS3231 RTC, and a 16x2 I2C LCD. The controller reports every component's health to the admin **Hardware** page, sends a heartbeat every five seconds, and sends an RFID **entry** event while a vehicle is detected or an **exit** event after it leaves the slot.
+
+### Install on the Pi
+
+1. Enable **SPI** and **I2C** in `sudo raspi-config`. Disable the serial console because the prototype uses GPIO14 and GPIO15 for IR sensors.
+2. Copy the repository to the Pi, then install the controller dependencies:
+
+   ```bash
+   cd /opt/smartpark
+   python3 -m pip install -r hardware/pi_requirements.txt
+   sudo mkdir -p /etc/smartpark
+   sudo cp hardware/smartpark-pi.env.example /etc/smartpark/hardware.env
+   sudo nano /etc/smartpark/hardware.env
+   ```
+
+3. Set `SMARTPARK_API_URL` to the Railway backend URL and copy the exact Railway `HARDWARE_API_KEY` into `hardware.env`.
+4. Test with `python3 hardware/raspberry_pi_controller.py`. The LCD should show **SmartPark ready** and the admin Hardware page should show the prototype components.
+5. To start automatically after every Pi reboot:
+
+   ```bash
+   sudo cp hardware/smartpark-pi.service /etc/systemd/system/
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now smartpark-pi
+   sudo systemctl status smartpark-pi
+   ```
+
+### Prototype use
+
+- Use the keypad to choose parking duration: enter `1`–`12`, then press `#`. Press `*` to clear the entered duration.
+- Place a vehicle at a slot, then tap its RFID card on the reader for that slot to start parking.
+- Remove the vehicle, then tap the same card at the same reader to close the parking session.
+- The six LEDs are intentionally not driven in this reduced prototype list. Add the MCP23017 plus one resistor per LED to control them independently.
+
 ## Database migrations
 
 For an existing database, apply `database/migrations/002_spec_alignment.sql`, `database/migrations/003_messaging_auth.sql`, `database/migrations/004_login_dual_otp.sql`, `database/migrations/005_fastag_qr_refunds.sql`, and `database/migrations/006_phonepe_uat.sql` once. The messaging migrations add verification, password-reset, and login OTP storage.

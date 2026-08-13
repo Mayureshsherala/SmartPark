@@ -1,0 +1,16 @@
+[Unit]
+Description=SmartPark Raspberry Pi prototype controller
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/smartpark/hardware
+EnvironmentFile=/etc/smartpark/hardware.env
+ExecStart=/usr/bin/python3 /opt/smartpark/hardware/raspberry_pi_controller.py
+Restart=always
+RestartSec=5
+User=pi
+
+[Install]
+WantedBy=multi-user.target
