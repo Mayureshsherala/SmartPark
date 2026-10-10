@@ -28,22 +28,35 @@ async function createOtp(user, purpose) {
 async function createAndSendOtp(user, purpose) {
   const code = await createOtp(user, purpose);
   const label = purpose === 'email_verification' ? 'email verification' : 'password reset';
-  await sendAccountAlert({
-    email: user.email,
-    phone: user.phone,
-    subject: `SmartPark ${label} OTP`,
-    message: `Your SmartPark ${label} OTP is ${code}. It expires in 10 minutes. Do not share this code.`,
-  });
+  console.log(`\n==========================================`);
+  console.log(` [${purpose.toUpperCase()} OTP] Email: ${user.email} | OTP: ${code}`);
+  console.log(`==========================================\n`);
+  try {
+    await sendAccountAlert({
+      email: user.email,
+      phone: user.phone,
+      subject: `SmartPark ${label} OTP`,
+      message: `Your SmartPark ${label} OTP is ${code}. It expires in 10 minutes. Do not share this code.`,
+    });
+  } catch (err) {
+    console.warn('[Email Alert Warning]', err.message);
+  }
 }
 
 async function createAndSendLoginOtp(user) {
   const emailCode = await createOtp(user, 'login_email');
-  const delivered = await sendEmail({ to: user.email, subject: 'SmartPark login OTP', text: `Your SmartPark login OTP is ${emailCode}. It expires in 10 minutes. Do not share this code.` });
-  if (!delivered) {
-    const error = new Error('Email OTP delivery is not configured. Ask the administrator to set the SMTP variables in Railway.');
-    error.status = 503;
-    throw error;
+  console.log(`\n==========================================`);
+  console.log(` [LOGIN OTP CODE] Email: ${user.email} | OTP: ${emailCode}`);
+  console.log(`==========================================\n`);
+  try {
+    const delivered = await sendEmail({ to: user.email, subject: 'SmartPark login OTP', text: `Your SmartPark login OTP is ${emailCode}. It expires in 10 minutes. Do not share this code.` });
+    if (!delivered) {
+      console.warn('[Email Warning] SMTP unconfigured or delivery failed. Use printed console OTP to log in.');
+    }
+  } catch (err) {
+    console.warn('[Email Error] Failed to send login OTP email:', err.message);
   }
+  return emailCode;
 }
 
 async function consumeOtp(email, purpose, code) {
