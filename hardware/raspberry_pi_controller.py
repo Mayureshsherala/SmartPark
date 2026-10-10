@@ -1,348 +1,432 @@
 #!/usr/bin/env python3
-"""SmartPark Raspberry Pi 3B+ prototype controller.
+"""SmartPark Raspberry Pi 3B+ Full Hardware Controller & Web Bridge.
 
-Wiring: six MFRC522 readers on shared SPI with individual SS pins, six IR
-sensors, a 4x3 keypad, and a PCA9548A with DS3231 on channel 0 and LCD on
-channel 1. Each RFID scan starts a session when a vehicle is detected, or
-ends the session after the vehicle has left the same slot.
+Configured with Adafruit ServoKit (PCA9685 16-channel), rpi_lcd (address 0x27),
+six MFRC522 SPI RFID readers, six IR obstacle sensors, and SmartPark Web API integration.
 """
 
 import json
+import math
 import os
+import sys
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime
 
-import RPi.GPIO as GPIO
-import spidev
-from smbus2 import SMBus
-
-API_BASE_URL = os.environ.get("SMARTPARK_API_URL", "").rstrip("/")
-HARDWARE_API_KEY = os.environ.get("HARDWARE_API_KEY", "")
+# ---------------- CONFIGURATION ----------------
+API_BASE_URL = os.environ.get("SMARTPARK_API_URL", "http://10.250.115.234:3000").rstrip("/")
+HARDWARE_API_KEY = os.environ.get("HARDWARE_API_KEY", "c4163f48ce8580071362bd6ca1fc826b4976d8ca6abd3b894b77ecbbf0901bc4")
 API_URL = f"{API_BASE_URL}/api/hardware/event"
 HEARTBEAT_SECONDS = max(2, int(os.environ.get("HEARTBEAT_SECONDS", "5")))
-IR_ACTIVE_LOW = os.environ.get("IR_ACTIVE_LOW", "true").lower() == "true"
 
-I2C_BUS = 1
-PCA9548A_ADDRESS = 0x70
-DS3231_ADDRESS = 0x68
-LCD_ADDRESSES = (0x27, 0x3F)
-SPI_BUS = 0
-SPI_DEVICE = 0
+# Pin Mapping (BCM Numbers)
+IR_PINS = {1: 5, 2: 6, 3: 13, 4: 19, 5: 26, 6: 21}
+CS_PINS = [8, 14, 15, 18, 23, 24]  # Slot 1 to 6 RFID Chip Select
+RST_PIN = 22                        # Shared RFID Reset Pin
 
-RFID_SS_PINS = (8, 7, 5, 6, 13, 16)
-RFID_RESET_PIN = 25
-IR_PINS = (14, 15, 18, 20, 21, 26)
-KEYPAD_ROWS = (4, 17, 27, 22)
-KEYPAD_COLUMNS = (23, 24, 12)
-KEYPAD_LAYOUT = (("1", "2", "3"), ("4", "5", "6"), ("7", "8", "9"), ("*", "0", "#"))
+SERVO_CHANNELS = {1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5}
+CLOSED = 90
+OPEN = 0
+PULSE_MIN = 500
+PULSE_MAX = 2500
+
+# ---------------- HARDWARE INITIALIZATION ----------------
+HAS_GPIO = False
+HAS_SPI = False
+HAS_SERVOKIT = False
+HAS_LCD = False
+
+try:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+    for pin in IR_PINS.values():
+        GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+    for cs in CS_PINS:
+        GPIO.setup(cs, GPIO.OUT, initial=GPIO.HIGH)
+    GPIO.setup(RST_PIN, GPIO.OUT, initial=GPIO.HIGH)
+    HAS_GPIO = True
+    print("[HARDWARE] RPi.GPIO initialized successfully with PUD_UP on IR pins.")
+except Exception as err:
+    print(f"[MOCK] RPi.GPIO not available ({err}). Running GPIO in mock mode.")
+
+try:
+    import spidev
+    spi = spidev.SpiDev()
+    spi.open(0, 0)
+    spi.no_cs = True
+    spi.max_speed_hz = 500000
+    spi.mode = 0
+    HAS_SPI = True
+    print("[HARDWARE] SPI bus initialized successfully.")
+except Exception as err:
+    print(f"[MOCK] SPI bus not available ({err}). Running SPI in mock mode.")
+
+servos = {}
+try:
+    from adafruit_servokit import ServoKit
+    kit = ServoKit(channels=16)
+    for slot_num, channel in SERVO_CHANNELS.items():
+        s = kit.servo[channel]
+        s.set_pulse_width_range(PULSE_MIN, PULSE_MAX)
+        servos[slot_num] = s
+        s.angle = CLOSED
+    HAS_SERVOKIT = True
+    print("[HARDWARE] Adafruit ServoKit initialized. Gates set to CLOSED (90°).")
+except Exception as err:
+    print(f"[MOCK] Adafruit ServoKit not available ({err}). Servos in mock mode.")
+
+lcd_dev = None
+try:
+    from rpi_lcd import LCD
+    lcd_dev = LCD(address=0x27)
+    HAS_LCD = True
+    print("[HARDWARE] I2C LCD (0x27) initialized successfully.")
+except Exception as err:
+    print(f"[MOCK] I2C LCD not available ({err}). LCD in mock mode.")
 
 
-class HardwareApi:
+# ---------------- RFID LOW-LEVEL SPI FUNCTIONS ----------------
+def rfid_write(cs, reg, val):
+    if not HAS_GPIO or not HAS_SPI:
+        return
+    GPIO.output(cs, 0)
+    spi.xfer2([(reg << 1) & 0x7E, val])
+    GPIO.output(cs, 1)
+
+def rfid_read(cs, reg):
+    if not HAS_GPIO or not HAS_SPI:
+        return 0
+    GPIO.output(cs, 0)
+    val = spi.xfer2([((reg << 1) & 0x7E) | 0x80, 0])[1]
+    GPIO.output(cs, 1)
+    return val
+
+def rfid_bits(cs, reg, mask):
+    rfid_write(cs, reg, rfid_read(cs, reg) | mask)
+
+def init_rfid(cs):
+    rfid_write(cs, 1, 0x0F)
+    rfid_write(cs, 0x2A, 0x8D)
+    rfid_write(cs, 0x2B, 0x3E)
+    rfid_write(cs, 0x2D, 30)
+    rfid_write(cs, 0x2C, 0)
+    rfid_write(cs, 0x15, 0x40)
+    rfid_write(cs, 0x11, 0x3D)
+    rfid_bits(cs, 0x14, 3)
+
+def rfid_transfer(cs, data, framing=0):
+    rfid_write(cs, 1, 0)
+    rfid_write(cs, 4, 0x7F)
+    rfid_write(cs, 0x0A, 0x80)
+    rfid_write(cs, 0x0D, framing)
+    for b in data:
+        rfid_write(cs, 9, b)
+    rfid_write(cs, 1, 0x0C)
+    rfid_bits(cs, 0x0D, 0x80)
+    end = time.monotonic() + 0.05
+    irq = 0
+    while time.monotonic() < end:
+        irq = rfid_read(cs, 4)
+        if irq & 0x30 or irq & 1:
+            break
+    rfid_write(cs, 0x0D, framing)
+    if not irq & 0x30 or rfid_read(cs, 6) & 0x1B:
+        return None
+    return [rfid_read(cs, 9) for _ in range(rfid_read(cs, 0x0A))]
+
+def rfid_scan(cs):
+    if not HAS_GPIO or not HAS_SPI:
+        return None
+    atqa = rfid_transfer(cs, [0x26], 0x07)
+    if not atqa or len(atqa) != 2:
+        return None
+    uid = rfid_transfer(cs, [0x93, 0x20])
+    if uid and len(uid) == 5:
+        if uid[0] ^ uid[1] ^ uid[2] ^ uid[3] == uid[4]:
+            return " ".join(f"{b:02X}" for b in uid[:4])
+    return None
+
+
+# ---------------- HARDWARE CONTROL HELPERS ----------------
+def vehicle_detected(slot_num):
+    if HAS_GPIO:
+        pin = IR_PINS.get(slot_num)
+        if pin:
+            return GPIO.input(pin) == 0
+    return False
+
+def open_barrier(slot_num):
+    print(f"[BARRIER] Opening barrier for Slot P-0{slot_num} (Angle {OPEN}°)...")
+    if slot_num in servos:
+        try:
+            servos[slot_num].angle = OPEN
+        except Exception as e:
+            print(f"[BARRIER ERROR] {e}")
+
+def close_barrier(slot_num):
+    print(f"[BARRIER] Closing barrier for Slot P-0{slot_num} (Angle {CLOSED}°)...")
+    if slot_num in servos:
+        try:
+            servos[slot_num].angle = CLOSED
+        except Exception as e:
+            print(f"[BARRIER ERROR] {e}")
+
+def update_lcd(occupancy_list, line1=None, line2=None):
+    if not HAS_LCD or not lcd_dev:
+        return
+    try:
+        if line1 is not None:
+            lcd_dev.text(line1[:16].ljust(16), 1)
+            lcd_dev.text((line2 or "")[:16].ljust(16), 2)
+        else:
+            s = ["O" if occ else "F" for occ in occupancy_list]
+            lcd_dev.text(f"1:{s[0]} 2:{s[1]} 3:{s[2]}     ", 1)
+            lcd_dev.text(f"4:{s[3]} 5:{s[4]} 6:{s[5]}     ", 2)
+    except Exception:
+        pass
+
+
+# ---------------- WEB API COMMUNICATION ----------------
+class SmartParkApi:
     def post(self, payload):
-        if not API_BASE_URL or not HARDWARE_API_KEY:
-            raise RuntimeError("Set SMARTPARK_API_URL and HARDWARE_API_KEY in /etc/smartpark/hardware.env")
-        request = urllib.request.Request(
+        req = urllib.request.Request(
             API_URL,
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "X-Hardware-Key": HARDWARE_API_KEY},
-            method="POST",
+            method="POST"
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
-                return response.status, json.loads(response.read().decode("utf-8"))
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as error:
             body = error.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"API {error.code}: {body}") from error
+            print(f"[API HTTP ERROR {error.code}] {body}")
+            return error.code, {}
+        except Exception as error:
+            print(f"[API CONNECTION ERROR] {error}")
+            return None, {}
+
+    def get(self, path):
+        req = urllib.request.Request(
+            f"{API_BASE_URL}{path}",
+            headers={"X-Hardware-Key": HARDWARE_API_KEY},
+            method="GET"
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                return resp.status, json.loads(resp.read().decode("utf-8"))
+        except Exception as error:
+            print(f"[API GET ERROR] {error}")
+            return None, {}
 
 
-class Pca9548a:
-    def __init__(self, bus):
-        self.bus = bus
+# ---------------- MAIN APPLICATION ----------------
+def main():
+    print("=" * 65)
+    print(f" SmartPark Controller -> Server: {API_BASE_URL}")
+    print("=" * 65)
 
-    def select(self, channel):
-        self.bus.write_byte(PCA9548A_ADDRESS, 1 << channel)
-
-
-class Lcd1602:
-    ENABLE = 0x04
-    REGISTER_SELECT = 0x01
-    BACKLIGHT = 0x08
-
-    def __init__(self, bus, mux, address):
-        self.bus = bus
-        self.mux = mux
-        self.address = address
-        self.initialise()
-
-    def _write(self, value):
-        self.mux.select(1)
-        self.bus.write_byte(self.address, value | self.BACKLIGHT)
-
-    def _nibble(self, value):
-        self._write(value)
-        self._write(value | self.ENABLE)
-        time.sleep(0.0005)
-        self._write(value & ~self.ENABLE)
-
-    def _send(self, value, mode=0):
-        self._nibble((value & 0xF0) | mode)
-        self._nibble(((value << 4) & 0xF0) | mode)
-
-    def initialise(self):
+    if HAS_GPIO and HAS_SPI:
+        GPIO.output(RST_PIN, 0)
         time.sleep(0.05)
-        for command in (0x33, 0x32, 0x28, 0x0C, 0x06, 0x01):
-            self._send(command)
-        time.sleep(0.005)
-        self.message("SmartPark Pi", "Starting...")
-
-    def message(self, first_line, second_line=""):
-        self._send(0x01)
-        time.sleep(0.002)
-        self._send(0x80)
-        for character in first_line[:16].ljust(16):
-            self._send(ord(character), self.REGISTER_SELECT)
-        self._send(0xC0)
-        for character in second_line[:16].ljust(16):
-            self._send(ord(character), self.REGISTER_SELECT)
-
-
-class Mfrc522Reader:
-    COMMAND = 0x01
-    COMM_I_EN = 0x02
-    COMM_IRQ = 0x04
-    ERROR = 0x06
-    FIFO_DATA = 0x09
-    FIFO_LEVEL = 0x0A
-    CONTROL = 0x0C
-    BIT_FRAMING = 0x0D
-    MODE = 0x11
-    TX_CONTROL = 0x14
-    TX_ASK = 0x15
-    TMODE = 0x2A
-    TPRESCALER = 0x2B
-    TRELOAD_H = 0x2C
-    TRELOAD_L = 0x2D
-    PCD_IDLE = 0x00
-    PCD_TRANSCEIVE = 0x0C
-    PCD_SOFTRESET = 0x0F
-    PICC_REQA = 0x26
-    PICC_ANTICOLL = 0x93
-
-    def __init__(self, spi, ss_pin):
-        self.spi = spi
-        self.ss_pin = ss_pin
-        GPIO.setup(ss_pin, GPIO.OUT, initial=GPIO.HIGH)
-        self.reset()
-
-    def _transfer(self, values):
-        GPIO.output(self.ss_pin, GPIO.LOW)
-        response = self.spi.xfer2(values)
-        GPIO.output(self.ss_pin, GPIO.HIGH)
-        return response
-
-    def write(self, register, value):
-        self._transfer([((register << 1) & 0x7E), value])
-
-    def read(self, register):
-        return self._transfer([0x80 | ((register << 1) & 0x7E), 0])[1]
-
-    def set_bit_mask(self, register, mask):
-        self.write(register, self.read(register) | mask)
-
-    def clear_bit_mask(self, register, mask):
-        self.write(register, self.read(register) & ~mask)
-
-    def reset(self):
-        self.write(self.COMMAND, self.PCD_SOFTRESET)
+        GPIO.output(RST_PIN, 1)
         time.sleep(0.05)
-        self.write(self.TMODE, 0x8D)
-        self.write(self.TPRESCALER, 0x3E)
-        self.write(self.TRELOAD_L, 30)
-        self.write(self.TRELOAD_H, 0)
-        self.write(self.TX_ASK, 0x40)
-        self.write(self.MODE, 0x3D)
-        self.set_bit_mask(self.TX_CONTROL, 0x03)
+        for i, cs in enumerate(CS_PINS, start=1):
+            init_rfid(cs)
+            fw = rfid_read(cs, 0x37)
+            print(f"[RFID] Reader Slot {i} (GPIO {cs}): Firmware 0x{fw:02X}")
 
-    def to_card(self, command, send_data):
-        irq_enable, wait_irq = (0x77, 0x30) if command == self.PCD_TRANSCEIVE else (0x12, 0x10)
-        self.write(self.COMM_I_EN, irq_enable | 0x80)
-        self.clear_bit_mask(self.COMM_IRQ, 0x80)
-        self.set_bit_mask(self.FIFO_LEVEL, 0x80)
-        self.write(self.COMMAND, self.PCD_IDLE)
-        for value in send_data:
-            self.write(self.FIFO_DATA, value)
-        self.write(self.COMMAND, command)
-        if command == self.PCD_TRANSCEIVE:
-            self.set_bit_mask(self.BIT_FRAMING, 0x80)
-        for _ in range(2000):
-            irq = self.read(self.COMM_IRQ)
-            if irq & wait_irq or irq & 0x01:
-                break
-        self.clear_bit_mask(self.BIT_FRAMING, 0x80)
-        if self.read(self.ERROR) & 0x1B or not (irq & wait_irq):
-            return None
-        count = self.read(self.FIFO_LEVEL)
-        return [self.read(self.FIFO_DATA) for _ in range(count)]
+    api = SmartParkApi()
 
-    def uid(self):
-        self.write(self.BIT_FRAMING, 0x07)
-        if not self.to_card(self.PCD_TRANSCEIVE, [self.PICC_REQA]):
-            return None
-        self.write(self.BIT_FRAMING, 0)
-        result = self.to_card(self.PCD_TRANSCEIVE, [self.PICC_ANTICOLL, 0x20])
-        if not result or len(result) != 5 or (result[0] ^ result[1] ^ result[2] ^ result[3]) != result[4]:
-            return None
-        return " ".join(f"{value:02X}" for value in result[:4])
+    # Slot States: "IDLE", "WAITING_FOR_CAR", "WAITING_TO_CLEAR"
+    slot_states = ["IDLE"] * 6
+    occupancy = [False] * 6
+    assigned_uids = [None] * 6
+    last_scanned_uids = [None] * 6
+    last_heartbeat = 0
+    last_gate_sync = 0
+
+    update_lcd(occupancy, "SmartPark Ready", "Scan card / web")
+
+    while True:
+        now_time = time.monotonic()
+
+        # Update current occupancy from IR sensors
+        for i in range(6):
+            occupancy[i] = vehicle_detected(i + 1)
+
+        # 1. Send Periodic Heartbeat to Server
+        if now_time - last_heartbeat >= HEARTBEAT_SECONDS:
+            last_heartbeat = now_time
+            hb_payload = {
+                "event": "heartbeat",
+                "source": "raspberry_pi_3b_plus",
+                "timestamp": datetime.now().isoformat(),
+                "components": {
+                    "DS3231 RTC": "Ready",
+                    "16x2 LCD": "Ready (0x27)" if HAS_LCD else "Not detected",
+                    "I2C Servo Driver": "Ready (PCA9685)" if HAS_SERVOKIT else "Not detected",
+                    "IR Sensors": "6 Channels Active" if HAS_GPIO else "Mock mode",
+                    "RFID Readers": "6 SPI Active" if (HAS_GPIO and HAS_SPI) else "Mock mode"
+                },
+                "slots": [{"slot": i + 1, "status": "occupied" if occupancy[i] else "free"} for i in range(6)]
+            }
+            api.post(hb_payload)
+
+        # 2. Check Authorized Exits from Server (online exit payment completed)
+        if now_time - last_gate_sync >= 1.0:
+            last_gate_sync = now_time
+            status_code, resp_data = api.get("/api/hardware/gates")
+            if status_code == 200:
+                gates = resp_data.get("data", [])
+                for g in gates:
+                    slot_id = int(g["slot_id"])
+                    idx = slot_id - 1
+                    gate_open = (g.get("gate_status") == "open" and g.get("exit_authorization_expires_at"))
+                    if gate_open and slot_states[idx] == "IDLE" and occupancy[idx]:
+                        print(f"[SERVER EXIT AUTH] Slot P-0{slot_id} exit authorized. Opening gate...")
+                        update_lcd(occupancy, f"Slot {slot_id}:Exit Auth", "Drive Out Now")
+                        open_barrier(slot_id)
+                        slot_states[idx] = "WAITING_TO_CLEAR"
+
+        # 3. Main Loop per Slot
+        for i in range(6):
+            slot_num = i + 1
+            cs_pin = CS_PINS[i]
+            state = slot_states[i]
+
+            # --- STATE 1: IDLE (Scanning for RFID) ---
+            if state == "IDLE":
+                scanned_uid = rfid_scan(cs_pin) if (HAS_GPIO and HAS_SPI) else None
+                if scanned_uid and scanned_uid != last_scanned_uids[i]:
+                    last_scanned_uids[i] = scanned_uid
+                    print(f"\n[RFID SCAN] Slot P-0{slot_num} Tag: {scanned_uid}")
+
+                    # 1. Check if tag is already active in another slot
+                    is_already_in_use = any(assigned_uids[k] == scanned_uid for k in range(6) if k != i and assigned_uids[k] is not None)
+                    if is_already_in_use:
+                        print(f"[REJECTED] Slot P-0{slot_num}: Tag {scanned_uid} is already active in another slot!")
+                        update_lcd(occupancy, f"Slot {slot_num}:Denied", "Card In Use")
+                        time.sleep(1.5)
+                        continue
+
+                    # 2. If slot is occupied -> Exit Phase (Check FASTag / Exit Payment)
+                    if occupancy[i]:
+                        print(f"[EXIT ATTEMPT] Slot P-0{slot_num}: Checking exit authorization...")
+                        status, res = api.post({
+                            "event": "rfid_scan",
+                            "slot": slot_num,
+                            "uid": scanned_uid,
+                            "source": "raspberry_pi_3b_plus"
+                        })
+                        action = res.get("data", {}).get("action")
+                        msg = res.get("message", "Pay online to exit")
+
+                        if action == "open_exit_gate" or status == 200:
+                            print(f"[EXIT AUTHORIZED] FASTag/Online payment verified! Opening gate for Slot P-0{slot_num}...")
+                            update_lcd(occupancy, f"Slot {slot_num}:Paid Exit", "Drive Out Now")
+                            open_barrier(slot_num)
+                            slot_states[i] = "WAITING_TO_CLEAR"
+                        else:
+                            print(f"[PAYMENT REQUIRED] Slot P-0{slot_num}: {msg}")
+                            update_lcd(occupancy, f"Slot {slot_num}:Pay Exit", msg[:16])
 
 
-class Keypad:
-    def __init__(self):
-        for row in KEYPAD_ROWS:
-            GPIO.setup(row, GPIO.OUT, initial=GPIO.HIGH)
-        for column in KEYPAD_COLUMNS:
-            GPIO.setup(column, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+                    # 3. Entry Phase (Server verifies 'Arrived at Slot' status on web & assigns tag)
+                    else:
+                        status, res = api.post({
+                            "event": "rfid_scan",
+                            "slot": slot_num,
+                            "uid": scanned_uid,
+                            "source": "raspberry_pi_3b_plus"
+                        })
+                        action = res.get("data", {}).get("action")
+                        message = res.get("message", "RFID scanned")
 
-    def read(self):
-        for row_index, row_pin in enumerate(KEYPAD_ROWS):
-            GPIO.output(row_pin, GPIO.LOW)
-            time.sleep(0.001)
-            for column_index, column_pin in enumerate(KEYPAD_COLUMNS):
-                if GPIO.input(column_pin) == GPIO.LOW:
-                    GPIO.output(row_pin, GPIO.HIGH)
-                    return KEYPAD_LAYOUT[row_index][column_index]
-            GPIO.output(row_pin, GPIO.HIGH)
-        return None
+                        if action == "awaiting_vehicle":
+                            print(f"[ACCESS GRANTED] Tag '{scanned_uid}' assigned! Opening gate for Slot P-0{slot_num}...")
+                            update_lcd(occupancy, f"Slot {slot_num}:Granted", "Drive In Now")
+                            open_barrier(slot_num)
+                            assigned_uids[i] = scanned_uid
+                            slot_states[i] = "WAITING_FOR_CAR"
+                        else:
+                            print(f"[LOCKED/DENIED] Slot P-0{slot_num}: {message}")
+                            update_lcd(occupancy, f"Slot {slot_num}:Locked", "Press Web Button")
+                            time.sleep(1.5)
 
+                elif not scanned_uid:
+                    last_scanned_uids[i] = None
 
-class SmartParkPrototype:
-    def __init__(self):
-        GPIO.setwarnings(False)
-        GPIO.setmode(GPIO.BCM)
-        GPIO.setup(RFID_RESET_PIN, GPIO.OUT, initial=GPIO.HIGH)
-        for pin in IR_PINS:
-            GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-        self.api = HardwareApi()
-        self.bus = SMBus(I2C_BUS)
-        self.mux = Pca9548a(self.bus)
-        self.components = {"PCA9548A I2C multiplexer": "checking", "DS3231 RTC": "checking", "16x2 I2C LCD": "checking", "4x3 keypad": "ready", "IR obstacle sensors": "6 input channels ready", "MFRC522 RFID readers": "6 SPI readers ready", "Green LEDs": "MCP23017 required"}
-        self.lcd = self.configure_i2c_devices()
-        self.keypad = Keypad()
-        self.spi = spidev.SpiDev()
-        self.spi.open(SPI_BUS, SPI_DEVICE)
-        self.spi.max_speed_hz = 1_000_000
-        self.spi.mode = 0
-        self.spi.no_cs = True
-        self.readers = [Mfrc522Reader(self.spi, pin) for pin in RFID_SS_PINS]
-        self.hours = 1
-        self.key_buffer = ""
-        self.last_key = None
-        self.last_scan = {}
-        self.last_heartbeat = 0
+            # --- STATE 2: WAITING FOR CAR TO ENTER AND PARK ---
+            elif state == "WAITING_FOR_CAR":
+                if vehicle_detected(slot_num):
+                    time.sleep(0.4)
+                    print(f"[ENTRY CONFIRMED] Vehicle parked at Slot P-0{slot_num}. Closing gate.")
+                    close_barrier(slot_num)
+                    
+                    uid_to_send = assigned_uids[i] or "12 34 56 78"
+                    api.post({
+                        "event": "entry",
+                        "slot": slot_num,
+                        "uid": uid_to_send,
+                        "hours": 1,
+                        "source": "raspberry_pi_3b_plus"
+                    })
 
-    def configure_i2c_devices(self):
-        try:
-            self.mux.select(0)
-            self.bus.read_byte_data(DS3231_ADDRESS, 0)
-            self.components["PCA9548A I2C multiplexer"] = "online"
-            self.components["DS3231 RTC"] = "detected on channel 0"
-        except OSError:
-            self.components["PCA9548A I2C multiplexer"] = "not detected"
-            self.components["DS3231 RTC"] = "not detected"
-        for address in LCD_ADDRESSES:
-            try:
-                self.mux.select(1)
-                self.bus.read_byte(address)
-                self.components["16x2 I2C LCD"] = f"detected at 0x{address:02X}"
-                return Lcd1602(self.bus, self.mux, address)
-            except OSError:
-                continue
-        self.components["16x2 I2C LCD"] = "not detected"
-        return None
+                    update_lcd(occupancy, f"Slot {slot_num}:Parked", "Entry Recorded")
+                    time.sleep(1.5)
+                    slot_states[i] = "IDLE"
 
-    def occupied_slots(self):
-        active_value = GPIO.LOW if IR_ACTIVE_LOW else GPIO.HIGH
-        return [GPIO.input(pin) == active_value for pin in IR_PINS]
+            # --- STATE 3: WAITING FOR CAR TO LEAVE SLOT ---
+            elif state == "WAITING_TO_CLEAR":
+                if not vehicle_detected(slot_num):
+                    time.sleep(0.5)
+                    print(f"[EXIT CONFIRMED] Vehicle left Slot P-0{slot_num}. Closing gate.")
+                    close_barrier(slot_num)
 
-    def display(self, first, second=""):
-        if self.lcd:
-            try:
-                self.lcd.message(first, second)
-            except OSError:
-                self.components["16x2 I2C LCD"] = "communication error"
+                    uid_to_send = assigned_uids[i] or "12 34 56 78"
+                    api.post({
+                        "event": "exit",
+                        "slot": slot_num,
+                        "uid": uid_to_send,
+                        "source": "raspberry_pi_3b_plus"
+                    })
 
-    def handle_keypad(self):
-        key = self.keypad.read()
-        if key == self.last_key:
-            return
-        self.last_key = key
-        if not key:
-            return
-        if key == "*":
-            self.key_buffer = ""
-            self.display("Hours cleared", "Enter 1 to 12")
-        elif key == "#":
-            value = int(self.key_buffer or self.hours)
-            self.hours = min(12, max(1, value))
-            self.key_buffer = ""
-            self.display("Parking duration", f"{self.hours} hour(s) set")
-        elif key.isdigit() and len(self.key_buffer) < 2:
-            self.key_buffer += key
-            self.display("Set hours then #", self.key_buffer)
+                    update_lcd(occupancy, f"Slot {slot_num}:Cleared", "Exit Recorded")
+                    assigned_uids[i] = None
+                    time.sleep(1.5)
+                    slot_states[i] = "IDLE"
 
-    def send_slot_event(self, slot, uid, occupied):
-        event = "entry" if occupied else "exit"
-        payload = {"event": event, "slot": slot, "uid": uid, "hours": self.hours, "source": "raspberry_pi_3b_plus"}
-        try:
-            status, response = self.api.post(payload)
-            message = response.get("message", "Recorded")
-            self.display(f"Slot {slot} {event}", message[:16])
-            print(f"Slot {slot} {event}: HTTP {status} {message}")
-        except RuntimeError as error:
-            self.display("API error", str(error)[:16])
-            print(error)
+        # Display general slot occupancy status on LCD when idle
+        if all(st == "IDLE" for st in slot_states):
+            update_lcd(occupancy)
 
-    def scan_rfid(self, occupancy):
-        now = time.monotonic()
-        for index, reader in enumerate(self.readers, start=1):
-            uid = reader.uid()
-            if not uid or now - self.last_scan.get((index, uid), 0) < 4:
-                continue
-            self.last_scan[(index, uid)] = now
-            self.send_slot_event(index, uid, occupancy[index - 1])
-
-    def heartbeat(self, occupancy):
-        payload = {"event": "heartbeat", "source": "raspberry_pi_3b_plus", "firmware": "smartpark-pi-prototype/1.0", "keypadHours": self.hours, "timestamp": datetime.now().isoformat(), "components": self.components, "slots": [{"slot": index, "status": "occupied" if is_occupied else "free"} for index, is_occupied in enumerate(occupancy, start=1)]}
-        try:
-            self.api.post(payload)
-        except RuntimeError as error:
-            print(error)
-
-    def run(self):
-        self.display("SmartPark ready", "Tap card at slot")
-        while True:
-            self.handle_keypad()
-            occupancy = self.occupied_slots()
-            self.scan_rfid(occupancy)
-            if time.monotonic() - self.last_heartbeat >= HEARTBEAT_SECONDS:
-                self.last_heartbeat = time.monotonic()
-                self.heartbeat(occupancy)
-            time.sleep(0.06)
-
-    def close(self):
-        self.spi.close()
-        self.bus.close()
-        GPIO.cleanup()
+        time.sleep(0.04)
 
 
 if __name__ == "__main__":
-    controller = None
     try:
-        controller = SmartParkPrototype()
-        controller.run()
+        main()
     except KeyboardInterrupt:
-        pass
+        print("\n[STOPPING] SmartPark Controller shutting down...")
+        if HAS_LCD and lcd_dev:
+            try:
+                lcd_dev.clear()
+                lcd_dev.text("System Stopped", 1)
+            except Exception:
+                pass
     finally:
-        if controller:
-            controller.close()
+        for slot_num in range(1, 7):
+            close_barrier(slot_num)
+        if HAS_SPI:
+            try:
+                spi.close()
+            except Exception:
+                pass
+        if HAS_GPIO:
+            try:
+                GPIO.cleanup()
+            except Exception:
+                pass

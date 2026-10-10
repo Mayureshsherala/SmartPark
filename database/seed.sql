@@ -1,3 +1,4 @@
 USE smart_parking;
-INSERT INTO users (name,email,password,phone,vehicle_number,rfid_uid,role,pass_type) VALUES ('System Admin','admin@smartpark.local','$2a$12$55W1CJvAAWBb3G25AUlUv.H78hiG0YyuLgOt/dolYiQxzFRgloqgW','9999999999','MH 00 SP 0001','AA BB CC DD','admin','monthly'),('Rahul Mehta','rahul@example.com','$2a$12$ryCmQSXnLRqTgBndZf8xZ.JXQqCbH0tyzPvwPZQNAgsQUbE9acHXi','9876543210','MH 12 AB 1104','42 12 DB E9','user','normal'),('Anita Rao','anita@example.com','$2a$12$ryCmQSXnLRqTgBndZf8xZ.JXQqCbH0tyzPvwPZQNAgsQUbE9acHXi','9876501234','MH 14 PT 7832','C1 D2 E3 F4','user','monthly');
--- Admin password: admin123. Other sample account passwords: parking123.
+INSERT INTO users (name,email,password,phone,vehicle_number,rfid_uid,role,pass_type) VALUES ('System Admin','admin@smartpark.local','$2a$12$55W1CJvAAWBb3G25AUlUv.H78hiG0YyuLgOt/dolYiQxzFRgloqgW','9999999999','MH 00 SP 0001','AA BB CC DD','admin','monthly');
+-- Admin password: admin123.
+

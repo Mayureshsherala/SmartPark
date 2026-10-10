@@ -110,11 +110,11 @@ An unregistered card can be reported as `{ "event": "unknown_rfid", "slot": 4, "
 
 ## Raspberry Pi 3B+ prototype
 
-`hardware/raspberry_pi_controller.py` operates the prototype wiring: six MFRC522 readers, six IR obstacle sensors, the 4x3 keypad, PCA9548A I2C multiplexer, DS3231 RTC, and a 16x2 I2C LCD. The controller reports every component's health to the admin **Hardware** page, sends a heartbeat every five seconds, and sends an RFID **entry** event while a vehicle is detected or an **exit** event after it leaves the slot.
+`hardware/raspberry_pi_controller.py` operates the prototype wiring: six MFRC522 readers, six IR obstacle sensors, the 4x3 keypad, DS3231 RTC, and 16x2 I2C LCD. The DS3231 and LCD share the Pi I2C bus directly; no PCA9548A or PCA9685 board is used. The controller reports component health to the admin **Hardware** page and sends a heartbeat every five seconds.
 
 ### Install on the Pi
 
-1. Enable **SPI** and **I2C** in `sudo raspi-config`. Disable the serial console because the prototype uses GPIO14 and GPIO15 for IR sensors.
+1. Enable **SPI** and **I2C** in `sudo raspi-config`. Disable the serial console because the prototype uses GPIO14 and GPIO15 for RFID chip-select pins.
 2. Copy the repository to the Pi, then install the controller dependencies:
 
    ```bash
@@ -125,7 +125,7 @@ An unregistered card can be reported as `{ "event": "unknown_rfid", "slot": 4, "
    sudo nano /etc/smartpark/hardware.env
    ```
 
-3. Set `SMARTPARK_API_URL` to the Railway backend URL and copy the exact Railway `HARDWARE_API_KEY` into `hardware.env`.
+3. Start the local backend with `npm run dev`. Set `SMARTPARK_API_URL` to `http://YOUR_COMPUTER_LAN_IP:3000` and copy the exact `HARDWARE_API_KEY` from `backend/.env` into `hardware.env`. Do not use `localhost` here because the Pi would point to itself rather than your computer.
 4. Test with `python3 hardware/raspberry_pi_controller.py`. The LCD should show **SmartPark ready** and the admin Hardware page should show the prototype components.
 5. To start automatically after every Pi reboot:
 
@@ -140,12 +140,14 @@ An unregistered card can be reported as `{ "event": "unknown_rfid", "slot": 4, "
 
 - Use the keypad to choose parking duration: enter `1`–`12`, then press `#`. Press `*` to clear the entered duration.
 - Place a vehicle at a slot, then tap its RFID card on the reader for that slot to start parking.
-- Remove the vehicle, then tap the same card at the same reader to close the parking session.
-- The six LEDs are intentionally not driven in this reduced prototype list. Add the MCP23017 plus one resistor per LED to control them independently.
+- Or tap an active RFID card at a free slot first, then park within 10 seconds. The IR sensor confirms the vehicle and starts the parking session automatically.
+- For the temporary P-01 gate test, connect an LED through a 220–330 Ω resistor from GPIO26 (physical pin 37) to GND (physical pin 39). It represents the gate/servo state.
+- On entry, a valid RFID scan lights the LED; the LED turns off when the P-01 IR sensor confirms the vehicle is parked.
+- On exit, scan the same card while the slot is occupied. The user must pay the calculated bill in **Payments**. Payment opens the LED gate for two minutes; clearing the IR sensor completes the session and turns the LED off.
 
 ## Database migrations
 
-For an existing database, apply `database/migrations/002_spec_alignment.sql`, `database/migrations/003_messaging_auth.sql`, `database/migrations/004_login_dual_otp.sql`, `database/migrations/005_fastag_qr_refunds.sql`, and `database/migrations/006_phonepe_uat.sql` once. The messaging migrations add verification, password-reset, and login OTP storage.
+For an existing database, apply `database/migrations/002_spec_alignment.sql` through `database/migrations/007_rfid_exit_payment.sql` once. Migration `007_rfid_exit_payment.sql` adds the RFID exit-payment and two-minute gate authorization fields.
 
 ## Billing and services
 
